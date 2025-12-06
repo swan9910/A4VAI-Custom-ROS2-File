@@ -25,8 +25,8 @@ class PointCloudFilter(Node):
         self.drone_pos = np.array([0.0, 0.0, 0.0])
 
         # 드론 필터링 파라미터
-        self.min_distance = 0.1
-        self.z_threshold = 0.1
+        self.min_distance = 2.0
+        self.z_threshold = 2.0
 
         # Z축 스케일링 파라미터 (새 포인트 생성 없이 값만 2배)
         self.z_scale = 2.0           # z값을 2배로 스케일링
