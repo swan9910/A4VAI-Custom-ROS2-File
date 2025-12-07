@@ -45,7 +45,7 @@ def generate_launch_description():
             {'fsm/fail_safe': True},
 
             # Grid Map 설정 - ⭐ 큰 맵용 ⭐
-            {'grid_map/resolution': 0.1},  # 0.15 → 0.2 (큰 맵이라 해상도 약간 감소)
+            {'grid_map/resolution': 1.0},  # 0.15 → 0.2 (큰 맵이라 해상도 약간 감소)
             {'grid_map/map_size_x': map_size_x},
             {'grid_map/map_size_y': map_size_y},
             {'grid_map/map_size_z': map_size_z},
@@ -80,8 +80,8 @@ def generate_launch_description():
             {'grid_map/min_ray_length': 1.0},  # 1.2 → 1.5
             {'grid_map/max_ray_length': 15.0},  # 12 → 15
 
-            {'grid_map/virtual_ceil_height': 50.0},
-            {'grid_map/visualization_truncate_height': 50.0},
+            {'grid_map/virtual_ceil_height': 10.0},
+            {'grid_map/visualization_truncate_height': 10.0},
             {'grid_map/show_occ_time': False},
             {'grid_map/pose_type': 2},
             {'grid_map/frame_id': 'world'},
