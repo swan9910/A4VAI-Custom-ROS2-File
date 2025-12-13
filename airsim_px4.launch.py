@@ -38,7 +38,7 @@ def generate_launch_description():
             {'fsm/flight_type': 1},
             {'fsm/thresh_replan_time': 1.0},
             {'fsm/thresh_no_replan_meter': 2.0},
-            {'fsm/planning_horizon': 40.0},
+            {'fsm/planning_horizon': 60.0},
             {'fsm/planning_horizen_time': 3.0},
             {'fsm/emergency_time': 1.0},
             {'fsm/realworld_experiment': False},
@@ -52,7 +52,7 @@ def generate_launch_description():
             {'grid_map/local_update_range_x': 50.0},  # 8 → 12 (넓은 범위)
             {'grid_map/local_update_range_y': 50.0},
             {'grid_map/local_update_range_z': 30.0},   # 5 → 6
-            {'grid_map/obstacles_inflation': 3.0},
+            {'grid_map/obstacles_inflation': 2.0},
             {'grid_map/local_map_margin': 20},  # 15 → 20
             {'grid_map/ground_height': 1.5},
 
@@ -96,11 +96,11 @@ def generate_launch_description():
             {'manager/use_distinctive_trajs': False},
             {'manager/drone_id': 0},
 
-            {'optimization/lambda_smooth': 2.0},
+            {'optimization/lambda_smooth': 1.0},
             {'optimization/lambda_collision': 2.5},
-            {'optimization/lambda_feasibility': 0.1},
-            {'optimization/lambda_fitness': 0.1},
-            {'optimization/dist0': 1.5},
+            {'optimization/lambda_feasibility': 2.0},
+            {'optimization/lambda_fitness': 0.01},
+            {'optimization/dist0': 3.5},
             {'optimization/swarm_clearance': 0.5},
             {'optimization/max_vel': max_vel},
             {'optimization/max_acc': max_acc},
@@ -135,11 +135,12 @@ def generate_launch_description():
     ld.add_action(DeclareLaunchArgument('map_size_x', default_value='220.0'))
     ld.add_action(DeclareLaunchArgument('map_size_y', default_value='220.0'))
     ld.add_action(DeclareLaunchArgument('map_size_z', default_value='30.0'))
-    ld.add_action(DeclareLaunchArgument('max_vel', default_value='4.0'))
-    ld.add_action(DeclareLaunchArgument('max_acc', default_value='1.0'))
+    ld.add_action(DeclareLaunchArgument('max_vel', default_value='5.0'))
+    ld.add_action(DeclareLaunchArgument('max_acc', default_value='1.5'))
 
     # Add nodes
     ld.add_action(ego_planner_node)
     ld.add_action(traj_server_node)
 
     return ld
+
