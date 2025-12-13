@@ -1,54 +1,60 @@
 #!/usr/bin/env python3
 import rclpy
 from rclpy.node import Node
+from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2
-from nav_msgs.msg import Odometry
 import numpy as np
-from tf2_ros import TransformListener, Buffer
 from scipy.spatial.transform import Rotation
+
+# PX4 메시지
+from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
+
 
 class PointCloudFilter(Node):
     def __init__(self):
         super().__init__('pointcloud_filter')
 
-        # TF Listener 초기화
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-
-        # AirSim 초기 위치 오프셋
-        self.initial_position_set = False
-        self.initial_airsim_x = -27.5
-        self.initial_airsim_y = 27.5
-        self.initial_airsim_z = 0.0
-
-        # 드론 위치 저장
+        # 드론 위치/자세 저장 (ENU 좌표계)
         self.drone_pos = np.array([0.0, 0.0, 0.0])
+        self.drone_quat = np.array([0.0, 0.0, 0.0, 1.0])  # [x, y, z, w]
+        self.drone_rotation_matrix = np.eye(3)
+
+        self.position_received = False
+        self.attitude_received = False
 
         # 드론 필터링 파라미터
         self.min_distance = 2.0
         self.z_threshold = 2.0
 
-        # Z축 스케일링 파라미터 (새 포인트 생성 없이 값만 2배)
-        self.z_scale = 2.0           # z값을 2배로 스케일링
-        self.z_scale_threshold = 2.0  # z > 2m인 포인트만 스케일링
+        # Z축 스케일링 파라미터
+        self.z_scale = 2.0
+        self.z_scale_threshold = 2.0
 
-        self.get_logger().info(f'🔧 PointCloud Filter with Z-Scaling (NO new points)')
-        self.get_logger().info(f'   z > {self.z_scale_threshold}m인 포인트의 z값을 {self.z_scale}배로 스케일링')
+        self.get_logger().info('PointCloud Filter (PX4 Direct Mode)')
+        self.get_logger().info('Using PX4 odom instead of TF')
 
-        # AirSim odom_local 구독
-        self.airsim_odom_sub = self.create_subscription(
-            Odometry,
-            '/airsim_node/SimpleFlight/odom_local',
-            self.airsim_odom_callback,
-            10
+        # QoS for PX4
+        qos_px4 = QoSProfile(
+            reliability=ReliabilityPolicy.BEST_EFFORT,
+            durability=DurabilityPolicy.VOLATILE,
+            history=HistoryPolicy.KEEP_LAST,
+            depth=5
         )
 
-        # ego_odom 구독
-        self.odom_sub = self.create_subscription(
-            Odometry,
-            '/ego_odom',
-            self.odom_callback,
-            10
+        # PX4 vehicle_local_position 구독
+        self.px4_pos_sub = self.create_subscription(
+            VehicleLocalPosition,
+            '/fmu/out/vehicle_local_position',
+            self.vehicle_local_position_callback,
+            qos_px4
+        )
+
+        # PX4 vehicle_attitude 구독
+        self.px4_att_sub = self.create_subscription(
+            VehicleAttitude,
+            '/fmu/out/vehicle_attitude',
+            self.attitude_callback,
+            qos_px4
         )
 
         # LIDAR 구독
@@ -68,32 +74,64 @@ class PointCloudFilter(Node):
 
         self.count = 0
 
-    def airsim_odom_callback(self, msg):
-        if not self.initial_position_set:
-            self.initial_airsim_x = -27.5
-            self.initial_airsim_y = 27.5
-            self.initial_airsim_z = 0.0
-            self.initial_position_set = True
-            self.get_logger().info(
-                f'📍 Initial AirSim Position: '
-                f'X={self.initial_airsim_x:.2f}, Y={self.initial_airsim_y:.2f}, Z={self.initial_airsim_z:.2f}'
-            )
+    def ned_to_enu(self, x_ned, y_ned, z_ned):
+        """NED 좌표를 ENU 좌표로 변환"""
+        return y_ned, x_ned, -z_ned
 
-    def odom_callback(self, msg):
-        self.drone_pos = np.array([
-            msg.pose.pose.position.x,
-            msg.pose.pose.position.y,
-            msg.pose.pose.position.z
-        ])
+    def vehicle_local_position_callback(self, msg):
+        """PX4 위치 콜백 - NED를 ENU로 변환"""
+        x_enu, y_enu, z_enu = self.ned_to_enu(msg.x, msg.y, msg.z)
+        self.drone_pos = np.array([x_enu, y_enu, z_enu])
+
+        if not self.position_received:
+            self.position_received = True
+            self.get_logger().info(f'PX4 Position received: X={x_enu:.2f}, Y={y_enu:.2f}, Z={z_enu:.2f}')
+
+    def attitude_callback(self, msg):
+        """PX4 자세 콜백 - FRD/NED를 ENU/FLU로 변환 (foxglove 방식)"""
+        # PX4 quaternion: [w, x, y, z] - FRD body frame to NED earth frame
+        q_px4 = [msg.q[0], msg.q[1], msg.q[2], msg.q[3]]
+
+        # scipy 형식으로 변환: [x, y, z, w]
+        q_frd_to_ned = [q_px4[1], q_px4[2], q_px4[3], q_px4[0]]
+
+        # NED to ENU 변환
+        q_ned_to_enu = Rotation.from_euler('ZYX', [np.pi/2, 0, np.pi], degrees=False).as_quat()
+
+        R_frd_to_ned = Rotation.from_quat(q_frd_to_ned)
+        R_ned_to_enu = Rotation.from_quat(q_ned_to_enu)
+
+        # FRD to ENU
+        R_frd_to_enu = R_ned_to_enu * R_frd_to_ned
+
+        # FRD to FLU 변환 (x축 180도 회전)
+        R_frd_to_flu = Rotation.from_euler('XYZ', [np.pi, 0, 0])
+
+        # FLU to ENU (최종 드론 자세)
+        R_flu_to_enu = R_frd_to_enu * R_frd_to_flu
+
+        self.drone_quat = R_flu_to_enu.as_quat()  # [x, y, z, w]
+        self.drone_rotation_matrix = R_flu_to_enu.as_matrix()
+
+        if not self.attitude_received:
+            self.attitude_received = True
+            euler = R_flu_to_enu.as_euler('XYZ', degrees=True)
+            self.get_logger().info(f'PX4 Attitude received: Roll={euler[0]:.1f}, Pitch={euler[1]:.1f}, Yaw={euler[2]:.1f}')
 
     def lidar_callback(self, msg):
         self.count += 1
+
+        # 위치/자세 수신 대기
+        if not self.position_received or not self.attitude_received:
+            if self.count % 50 == 0:
+                self.get_logger().warn('Waiting for PX4 position/attitude...')
+            return
 
         points = self.parse_pointcloud2(msg)
         if points is None or len(points) == 0:
             return
 
-        # STEP 1: 드론 중심 필터링
+        # STEP 1: 드론 중심 필터링 (라이다 프레임)
         xy_distances = np.sqrt(points[:, 0]**2 + points[:, 1]**2)
         height_diff = np.abs(points[:, 2])
 
@@ -103,71 +141,25 @@ class PointCloudFilter(Node):
         if len(filtered_points_lidar) == 0:
             return
 
-        # STEP 2: TF 변환
-        try:
-            transform = self.tf_buffer.lookup_transform(
-                'world',
-                msg.header.frame_id,
-                rclpy.time.Time(),
-                timeout=rclpy.duration.Duration(seconds=0.1)
+        # STEP 2: 라이다 프레임 -> 월드 프레임 변환 (PX4 odom 사용)
+        # 회전 적용 후 위치 이동
+        world_points = (self.drone_rotation_matrix @ filtered_points_lidar.T).T + self.drone_pos
+
+        # STEP 3: Z값 스케일링
+        world_points[:, 2] = world_points[:, 2] * self.z_scale
+
+        # 디버그 정보 출력
+        if self.count % 100 == 0:
+            self.get_logger().info(
+                f'Drone Pos: X={self.drone_pos[0]:.2f}, Y={self.drone_pos[1]:.2f}, Z={self.drone_pos[2]:.2f} | '
+                f'Points: {len(world_points)} pts (Z scaled x{self.z_scale})'
             )
 
-            translation = np.array([
-                transform.transform.translation.x,
-                transform.transform.translation.y,
-                transform.transform.translation.z
-            ])
-
-            rotation_quat = [
-                transform.transform.rotation.x,
-                transform.transform.rotation.y,
-                transform.transform.rotation.z,
-                transform.transform.rotation.w
-            ]
-
-            rotation_matrix = Rotation.from_quat(rotation_quat).as_matrix()
-            world_points_absolute = (rotation_matrix @ filtered_points_lidar.T).T + translation
-
-            # STEP 3: AirSim 초기 위치 오프셋 적용
-            if self.initial_position_set:
-                offset = np.array([
-                    self.initial_airsim_x,
-                    self.initial_airsim_y,
-                    self.initial_airsim_z
-                ])
-                world_points = world_points_absolute - offset
-            else:
-                if self.count % 50 == 0:
-                    self.get_logger().warn('Waiting for initial AirSim position...')
-                return
-
-            # ⭐ STEP 4: Z값 스케일링 (새 포인트 생성 없이!)
-            # z > 2m인 포인트의 z값만 2배로 스케일링
-            # 모든 포인트의 z값을 2배로 (조건 없이)
-            scaled_count = len(world_points)
-
-            if True:  # 항상 실행
-                # z > 2m인 포인트의 z값을 2배로
-                world_points[:, 2] = world_points[:, 2] * self.z_scale  # 모든 z값 2배
-
-            # 디버그 정보 출력
-            if self.count % 100 == 0:
-                self.get_logger().info(
-                    f'🔍 TF: X={translation[0]:.2f}, Y={translation[1]:.2f}, Z={translation[2]:.2f}\n'
-                    f'   Drone: X={self.drone_pos[0]:.2f}, Y={self.drone_pos[1]:.2f}, Z={self.drone_pos[2]:.2f}\n'
-                    f'   📊 Total: {len(world_points)} pts, Z-scaled: {scaled_count} pts (z>{self.z_scale_threshold}m → {self.z_scale}x)'
-                )
-
-        except Exception as e:
-            if self.count % 50 == 0:
-                self.get_logger().warn(f'TF lookup failed: {e}')
-            return
-
-        # STEP 5: 장애물 분석
+        # STEP 4: 장애물 분석
         if self.count % 10 == 0:
             self.analyze_obstacles(filtered_points_lidar)
 
-        # STEP 6: 발행 (포인트 수는 원본과 동일!)
+        # STEP 5: 발행
         filtered_msg = self.create_pointcloud2(world_points)
         filtered_msg.header.stamp = msg.header.stamp
         filtered_msg.header.frame_id = "world"
@@ -193,27 +185,26 @@ class PointCloudFilter(Node):
 
         warning = ""
         if min_dist < 2.5:
-            warning = "⚠️  매우 가까움!"
+            warning = "!! VERY CLOSE !!"
         elif min_dist < 4.0:
-            warning = "⚡ 주의!"
+            warning = "! CAUTION !"
         elif min_dist < 6.0:
-            warning = "👀 관찰 중"
+            warning = "watching"
 
         direction = self.get_direction(closest_point)
         self.get_logger().info(
-            f'🎯 최근접: {min_dist:.2f}m {direction} {warning}\n'
-            f'   🧭 전방={forward_dist:.2f}m, 후방={backward_dist:.2f}m, '
-            f'좌={left_dist:.2f}m, 우={right_dist:.2f}m'
+            f'Closest: {min_dist:.2f}m {direction} {warning} | '
+            f'F={forward_dist:.2f}m, B={backward_dist:.2f}m, L={left_dist:.2f}m, R={right_dist:.2f}m'
         )
 
     def get_direction(self, point):
         x, y, z = point
         if abs(x) > abs(y):
-            h_dir = "전방" if x > 0 else "후방"
+            h_dir = "Front" if x > 0 else "Back"
         else:
-            h_dir = "좌측" if y > 0 else "우측"
+            h_dir = "Left" if y > 0 else "Right"
         if abs(z) > 1.0:
-            v_dir = "위" if z > 0 else "아래"
+            v_dir = "Up" if z > 0 else "Down"
             return f"({h_dir}-{v_dir})"
         else:
             return f"({h_dir})"
@@ -250,6 +241,7 @@ class PointCloudFilter(Node):
         field.count = count
         return field
 
+
 def main(args=None):
     rclpy.init(args=args)
     node = PointCloudFilter()
@@ -260,6 +252,7 @@ def main(args=None):
     finally:
         node.destroy_node()
         rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
