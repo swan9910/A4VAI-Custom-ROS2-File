@@ -1,63 +1,48 @@
 #!/usr/bin/env python3
+"""
+AirSim Lidar to World Frame Converter with De-skewing
+- 각도 기반 모션 보정으로 스캔 중 드론 회전 보상
+"""
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPolicy
 from sensor_msgs.msg import PointCloud2
+from nav_msgs.msg import Odometry
 import numpy as np
-from scipy.spatial.transform import Rotation
-
-# PX4 메시지
-from px4_msgs.msg import VehicleLocalPosition, VehicleAttitude
+from scipy.spatial.transform import Rotation, Slerp
+from collections import deque
 
 
-class PointCloudFilter(Node):
+class LidarWorldTransformer(Node):
     def __init__(self):
-        super().__init__('pointcloud_filter')
+        super().__init__('lidar_world_transformer')
 
-        # 드론 위치/자세 저장 (ENU 좌표계)
+        # Odom 버퍼 (보간용)
+        self.odom_buffer = deque(maxlen=100)
+        self.odom_received = False
+
+        # 최신 odom (fallback)
         self.drone_pos = np.array([0.0, 0.0, 0.0])
-        self.drone_quat = np.array([0.0, 0.0, 0.0, 1.0])  # [x, y, z, w]
-        self.drone_rotation_matrix = np.eye(3)
+        self.drone_quat = np.array([0.0, 0.0, 0.0, 1.0])
 
-        self.position_received = False
-        self.attitude_received = False
-
-        # 드론 필터링 파라미터
+        # 필터링 파라미터
         self.min_distance = 2.0
         self.z_threshold = 2.0
 
-        # Z축 스케일링 파라미터
-        self.z_scale = 2.0
-        self.z_scale_threshold = 2.0
+        # 스캔 시간 (100Hz = 10ms per scan)
+        self.scan_duration = 0.01  # 초
 
-        self.get_logger().info('PointCloud Filter (PX4 Direct Mode)')
-        self.get_logger().info('Using PX4 odom instead of TF')
+        self.get_logger().info('=== Lidar World Transformer (De-skewing) ===')
+        self.get_logger().info('Angle-based motion compensation enabled')
 
-        # QoS for PX4
-        qos_px4 = QoSProfile(
-            reliability=ReliabilityPolicy.BEST_EFFORT,
-            durability=DurabilityPolicy.VOLATILE,
-            history=HistoryPolicy.KEEP_LAST,
-            depth=5
+        # AirSim odom_local 구독
+        self.odom_sub = self.create_subscription(
+            Odometry,
+            '/airsim_node/SimpleFlight/odom_local',
+            self.odom_callback,
+            50
         )
 
-        # PX4 vehicle_local_position 구독
-        self.px4_pos_sub = self.create_subscription(
-            VehicleLocalPosition,
-            '/fmu/out/vehicle_local_position',
-            self.vehicle_local_position_callback,
-            qos_px4
-        )
-
-        # PX4 vehicle_attitude 구독
-        self.px4_att_sub = self.create_subscription(
-            VehicleAttitude,
-            '/fmu/out/vehicle_attitude',
-            self.attitude_callback,
-            qos_px4
-        )
-
-        # LIDAR 구독
+        # AirSim LIDAR 구독
         self.lidar_sub = self.create_subscription(
             PointCloud2,
             '/airsim_node/SimpleFlight/lidar/points/RPLIDAR_A3',
@@ -65,8 +50,8 @@ class PointCloudFilter(Node):
             10
         )
 
-        # 퍼블리셔
-        self.filtered_pub = self.create_publisher(
+        # 월드 좌표계 포인트클라우드 퍼블리셔
+        self.world_pub = self.create_publisher(
             PointCloud2,
             '/camera/depth/points',
             10
@@ -74,140 +59,149 @@ class PointCloudFilter(Node):
 
         self.count = 0
 
-    def ned_to_enu(self, x_ned, y_ned, z_ned):
-        """NED 좌표를 ENU 좌표로 변환"""
-        return y_ned, x_ned, -z_ned
+    def odom_callback(self, msg):
+        """Odom을 버퍼에 저장"""
+        timestamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-    def vehicle_local_position_callback(self, msg):
-        """PX4 위치 콜백 - NED를 ENU로 변환"""
-        x_enu, y_enu, z_enu = self.ned_to_enu(msg.x, msg.y, msg.z)
-        self.drone_pos = np.array([x_enu, y_enu, z_enu])
+        pos = np.array([
+            msg.pose.pose.position.x,
+            msg.pose.pose.position.y,
+            msg.pose.pose.position.z
+        ])
 
-        if not self.position_received:
-            self.position_received = True
-            self.get_logger().info(f'PX4 Position received: X={x_enu:.2f}, Y={y_enu:.2f}, Z={z_enu:.2f}')
+        quat = np.array([
+            msg.pose.pose.orientation.x,
+            msg.pose.pose.orientation.y,
+            msg.pose.pose.orientation.z,
+            msg.pose.pose.orientation.w
+        ])
 
-    def attitude_callback(self, msg):
-        """PX4 자세 콜백 - FRD/NED를 ENU/FLU로 변환 (foxglove 방식)"""
-        # PX4 quaternion: [w, x, y, z] - FRD body frame to NED earth frame
-        q_px4 = [msg.q[0], msg.q[1], msg.q[2], msg.q[3]]
+        self.odom_buffer.append((timestamp, pos, quat))
+        self.drone_pos = pos
+        self.drone_quat = quat
 
-        # scipy 형식으로 변환: [x, y, z, w]
-        q_frd_to_ned = [q_px4[1], q_px4[2], q_px4[3], q_px4[0]]
+        if not self.odom_received:
+            self.odom_received = True
+            self.get_logger().info('Odom buffer active')
 
-        # NED to ENU 변환
-        q_ned_to_enu = Rotation.from_euler('ZYX', [np.pi/2, 0, np.pi], degrees=False).as_quat()
+    def get_odom_at_time(self, target_time):
+        """특정 시간의 odom 보간"""
+        if len(self.odom_buffer) < 2:
+            return self.drone_pos.copy(), Rotation.from_quat(self.drone_quat).as_matrix()
 
-        R_frd_to_ned = Rotation.from_quat(q_frd_to_ned)
-        R_ned_to_enu = Rotation.from_quat(q_ned_to_enu)
+        # 전후 odom 찾기
+        before = None
+        after = None
 
-        # FRD to ENU
-        R_frd_to_enu = R_ned_to_enu * R_frd_to_ned
+        for t, pos, quat in self.odom_buffer:
+            if t <= target_time:
+                before = (t, pos, quat)
+            elif after is None:
+                after = (t, pos, quat)
 
-        # FRD to FLU 변환 (x축 180도 회전)
-        R_frd_to_flu = Rotation.from_euler('XYZ', [np.pi, 0, 0])
+        if before is None:
+            t, pos, quat = self.odom_buffer[0]
+            return pos.copy(), Rotation.from_quat(quat).as_matrix()
+        if after is None:
+            t, pos, quat = self.odom_buffer[-1]
+            return pos.copy(), Rotation.from_quat(quat).as_matrix()
 
-        # FLU to ENU (최종 드론 자세)
-        R_flu_to_enu = R_frd_to_enu * R_frd_to_flu
+        t1, pos1, quat1 = before
+        t2, pos2, quat2 = after
 
-        self.drone_quat = R_flu_to_enu.as_quat()  # [x, y, z, w]
-        self.drone_rotation_matrix = R_flu_to_enu.as_matrix()
+        if t2 == t1:
+            alpha = 0.0
+        else:
+            alpha = np.clip((target_time - t1) / (t2 - t1), 0.0, 1.0)
 
-        if not self.attitude_received:
-            self.attitude_received = True
-            euler = R_flu_to_enu.as_euler('XYZ', degrees=True)
-            self.get_logger().info(f'PX4 Attitude received: Roll={euler[0]:.1f}, Pitch={euler[1]:.1f}, Yaw={euler[2]:.1f}')
+        # 위치 선형 보간
+        interp_pos = pos1 + alpha * (pos2 - pos1)
+
+        # 회전 SLERP 보간
+        try:
+            rotations = Rotation.from_quat([quat1, quat2])
+            slerp = Slerp([0, 1], rotations)
+            interp_rot = slerp(alpha).as_matrix()
+        except:
+            interp_rot = Rotation.from_quat(quat1).as_matrix()
+
+        return interp_pos, interp_rot
 
     def lidar_callback(self, msg):
         self.count += 1
 
-        # 위치/자세 수신 대기
-        if not self.position_received or not self.attitude_received:
-            if self.count % 50 == 0:
-                self.get_logger().warn('Waiting for PX4 position/attitude...')
+        if not self.odom_received:
+            if self.count % 100 == 0:
+                self.get_logger().warn('Waiting for odom...')
             return
 
+        # 포인트클라우드 파싱
         points = self.parse_pointcloud2(msg)
         if points is None or len(points) == 0:
             return
 
-        # STEP 1: 드론 중심 필터링 (라이다 프레임)
+        # 필터링
         xy_distances = np.sqrt(points[:, 0]**2 + points[:, 1]**2)
         height_diff = np.abs(points[:, 2])
-
         mask = (xy_distances >= self.min_distance) | ((xy_distances >= 0.5) & (height_diff > self.z_threshold))
-        filtered_points_lidar = points[mask]
+        filtered_points = points[mask]
 
-        if len(filtered_points_lidar) == 0:
+        if len(filtered_points) == 0:
             return
 
-        # STEP 2: 라이다 프레임 -> 월드 프레임 변환 (PX4 odom 사용)
-        # 회전 적용 후 위치 이동
-        world_points = (self.drone_rotation_matrix @ filtered_points_lidar.T).T + self.drone_pos
+        # 스캔 타임스탬프
+        scan_end_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        scan_start_time = scan_end_time - self.scan_duration
 
-        # STEP 3: Z값 스케일링
-        world_points[:, 2] = world_points[:, 2] * self.z_scale
+        # === De-skewing: 각 포인트별로 보간된 odom 적용 ===
+        # 각 포인트의 수평 각도 계산 (-π ~ π)
+        angles = np.arctan2(filtered_points[:, 1], filtered_points[:, 0])
 
-        # 디버그 정보 출력
+        # 각도를 0~1 진행도로 변환 (라이다가 -π에서 시작해서 π로 끝난다고 가정)
+        # progress = 0: 스캔 시작, progress = 1: 스캔 끝
+        progress = (angles + np.pi) / (2 * np.pi)
+
+        # 스캔 시작/끝 odom 가져오기
+        start_pos, start_rot = self.get_odom_at_time(scan_start_time)
+        end_pos, end_rot = self.get_odom_at_time(scan_end_time)
+
+        # 각 포인트 변환
+        world_points = np.zeros_like(filtered_points)
+
+        # 빠른 처리를 위해 몇 개의 구간으로 나눠서 처리
+        num_segments = 8
+        for seg in range(num_segments):
+            seg_start = seg / num_segments
+            seg_end = (seg + 1) / num_segments
+            seg_mask = (progress >= seg_start) & (progress < seg_end)
+
+            if not np.any(seg_mask):
+                continue
+
+            # 구간 중간 시점의 odom 보간
+            seg_progress = (seg_start + seg_end) / 2
+            seg_time = scan_start_time + seg_progress * self.scan_duration
+            seg_pos, seg_rot = self.get_odom_at_time(seg_time)
+
+            # 해당 구간 포인트 변환
+            seg_points = filtered_points[seg_mask]
+            world_points[seg_mask] = (seg_rot @ seg_points.T).T + seg_pos
+
+        # 디버그 출력
         if self.count % 100 == 0:
+            euler_start = Rotation.from_matrix(start_rot).as_euler('XYZ', degrees=True)
+            euler_end = Rotation.from_matrix(end_rot).as_euler('XYZ', degrees=True)
+            rot_diff = np.abs(euler_end - euler_start)
             self.get_logger().info(
-                f'Drone Pos: X={self.drone_pos[0]:.2f}, Y={self.drone_pos[1]:.2f}, Z={self.drone_pos[2]:.2f} | '
-                f'Points: {len(world_points)} pts (Z scaled x{self.z_scale})'
+                f'[{self.count}] De-skew: RPY diff=({rot_diff[0]:.2f}, {rot_diff[1]:.2f}, {rot_diff[2]:.2f}) deg | '
+                f'Pts: {len(world_points)}'
             )
 
-        # STEP 4: 장애물 분석
-        if self.count % 10 == 0:
-            self.analyze_obstacles(filtered_points_lidar)
-
-        # STEP 5: 발행
-        filtered_msg = self.create_pointcloud2(world_points)
-        filtered_msg.header.stamp = msg.header.stamp
-        filtered_msg.header.frame_id = "world"
-        self.filtered_pub.publish(filtered_msg)
-
-    def analyze_obstacles(self, points):
-        if len(points) == 0:
-            return
-        distances = np.sqrt(points[:, 0]**2 + points[:, 1]**2 + points[:, 2]**2)
-        min_idx = np.argmin(distances)
-        min_dist = distances[min_idx]
-        closest_point = points[min_idx]
-
-        forward_mask = points[:, 0] > 0
-        backward_mask = points[:, 0] < 0
-        left_mask = points[:, 1] > 0
-        right_mask = points[:, 1] < 0
-
-        forward_dist = distances[forward_mask].min() if forward_mask.any() else 999.0
-        backward_dist = distances[backward_mask].min() if backward_mask.any() else 999.0
-        left_dist = distances[left_mask].min() if left_mask.any() else 999.0
-        right_dist = distances[right_mask].min() if right_mask.any() else 999.0
-
-        warning = ""
-        if min_dist < 2.5:
-            warning = "!! VERY CLOSE !!"
-        elif min_dist < 4.0:
-            warning = "! CAUTION !"
-        elif min_dist < 6.0:
-            warning = "watching"
-
-        direction = self.get_direction(closest_point)
-        self.get_logger().info(
-            f'Closest: {min_dist:.2f}m {direction} {warning} | '
-            f'F={forward_dist:.2f}m, B={backward_dist:.2f}m, L={left_dist:.2f}m, R={right_dist:.2f}m'
-        )
-
-    def get_direction(self, point):
-        x, y, z = point
-        if abs(x) > abs(y):
-            h_dir = "Front" if x > 0 else "Back"
-        else:
-            h_dir = "Left" if y > 0 else "Right"
-        if abs(z) > 1.0:
-            v_dir = "Up" if z > 0 else "Down"
-            return f"({h_dir}-{v_dir})"
-        else:
-            return f"({h_dir})"
+        # 발행
+        world_msg = self.create_pointcloud2(world_points)
+        world_msg.header.stamp = msg.header.stamp
+        world_msg.header.frame_id = "world"
+        self.world_pub.publish(world_msg)
 
     def parse_pointcloud2(self, cloud_msg):
         dtype = np.dtype([('x', np.float32), ('y', np.float32), ('z', np.float32)])
@@ -244,7 +238,7 @@ class PointCloudFilter(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = PointCloudFilter()
+    node = LidarWorldTransformer()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
